@@ -211,6 +211,7 @@ class IPSLT(pl.LightningModule):
         first_output = decoder_outs[0]         # Initial decoder output
         last_output = decoder_outs[-1]         # Final refined decoder output
         intermediate_outputs = decoder_outs[1:-1]  # All intermediate outputs
+        tgt_ids = tgt_ids.to(first_output.device)
 
         # --- Cross Entropy Loss ---
         ce_loss_fn = torch.nn.CrossEntropyLoss(ignore_index=self.text_vocab["[PAD]"])
@@ -253,6 +254,7 @@ class IPSLT(pl.LightningModule):
             f"{split}/ce_loss_first": ce_loss_first.detach(),
             f"{split}/ce_loss_last": ce_loss_last.detach(),
             f"{split}/total_kl_div_loss": kl_div_loss_total.detach(),
+            f"{split}/total_loss": total_loss.detach()
         }
 
         # Total loss is a combination of cross-entropy and KL losses
@@ -264,12 +266,15 @@ class IPSLT(pl.LightningModule):
                 f"{split}/ce_loss_first": ce_loss_first.detach(),
                 f"{split}/ce_loss_last": ce_loss_last.detach(),
                 f"{split}/total_kl_div_loss": kl_div_loss_total.detach(),
+                f"{split}/total_loss": total_loss.detach()
+
             })
         elif split == "val":
             wandb.log({
                 f"{split}/ce_loss_first": ce_loss_first.detach(),
                 f"{split}/ce_loss_last": ce_loss_last.detach(),
                 f"{split}/total_kl_div_loss": kl_div_loss_total.detach(),
+                f"{split}/total_loss": total_loss.detach()
             })
         generated_ids_last = torch.argmax(last_output, dim=-1)
         generated_text_last = self.tokenizer.batch_decode(generated_ids_last, skip_special_tokens=True)

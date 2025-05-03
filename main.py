@@ -51,31 +51,31 @@ def train(args, cfg, model, model_path, vocab,
         text_vocab=vocab
     )
      
-    # model_trainer = pl.Trainer(
-    # callbacks=[best_pose_checkpoint, last_checkpoint, early_stopping],
-    # devices=4,
-    # num_nodes=1, 
-    # accelerator="gpu",
-    # strategy="ddp_find_unused_parameters_true"
-    # )
     model_trainer = pl.Trainer(
-        accelerator="cpu",  # CPU kullanımı için bu satırı ekledik
-        callbacks=[best_pose_checkpoint, last_checkpoint, early_stopping]
+    callbacks=[best_pose_checkpoint, last_checkpoint, early_stopping],
+    devices=4,
+    num_nodes=1, 
+    accelerator="gpu",
+    strategy="ddp_find_unused_parameters_true"
     )
+    # model_trainer = pl.Trainer(
+    #     accelerator="cpu",  # CPU kullanımı için bu satırı ekledik
+    #     callbacks=[best_pose_checkpoint, last_checkpoint, early_stopping]
+    # )
     model_trainer.fit(model, train_dataloader, val_dataloader)
     
 
 args = argparse.Namespace(
     mode="train",
-    config_path=r"configs/k3wkl3.yaml",
+    config_path=r"configs/k3wkl15_vega.yaml",
     model_path = None,
     device='cuda',
     seed=42,
     resume=False,
     start_epoch=0,
-    batch_size=32,
+    batch_size=64,
     epochs=379,
-    num_workers=0,
+    num_workers=8,
     print_frequency=100
     )
 
