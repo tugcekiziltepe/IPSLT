@@ -1,0 +1,49 @@
+data:
+  max_frame_len: 300
+  max_text_len: 52
+  # train:
+  #   embeddings_path: /ceph/hpc/home/eutugcek/PHOENIX14T/text_embeddings/train
+  #   features_path: /ceph/hpc/home/eutugcek/PHOENIX14T/dino_embeddings/train
+
+  # dev: 
+  #   embeddings_path: /ceph/hpc/home/eutugcek/PHOENIX14T/text_embeddings/dev
+  #   features_path:  /ceph/hpc/home/eutugcek/PHOENIX14T/dino_embeddings/dev
+  train:
+    embeddings_path: /Users/tugcekiziltepe/Downloads/text_embeddings/train
+    features_path: /Users/tugcekiziltepe/Documents/Projects/Hacettepe University/Sign Language Translation/Source codes/IPSLT/dino_embeddings/train
+    pt_file_path: /Users/tugcekiziltepe/Documents/Projects/Hacettepe University/Sign Language Translation/Source codes/slt/data/PHOENIX2014T/train.pt
+
+  dev: 
+    embeddings_path: /Users/tugcekiziltepe/Downloads/text_embeddings/dev
+    features_path: /Users/tugcekiziltepe/Documents/Projects/Hacettepe University/Sign Language Translation/Source codes/IPSLT/dino_embeddings/dev
+    pt_file_path: /Users/tugcekiziltepe/Documents/Projects/Hacettepe University/Sign Language Translation/Source codes/slt/data/PHOENIX2014T/dev.pt
+
+model:
+  first_stage_trainable: True
+  use_KL: True
+  K: 3
+  KL_lambda: 3
+  encoder:
+    dim_feedforward: 1024
+    encoder_dim: 768
+    n_layers: 3
+    n_heads: 4
+    activation: relu
+    dropout: 0.1
+
+  decoder: 
+    dim_feedforward: 1024
+    decoder_dim: 768
+    n_layers: 6
+    n_heads: 8
+    activation: relu
+    dropout: 0.1
+
+  embeddings:
+    embedding_dim: 768
+  
+training:
+  optimizer: adam
+  base_learning_rate: 0.0002
+  weight_decay: 0.0001
+

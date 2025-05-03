@@ -6,77 +6,77 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 import torch.nn.functional as F
+import gzip
+import pickle
+import torch.utils.data.dataset as Dataset
+from PIL import Image
+from src.utils import pad_or_truncate_frames
 
-class PHEONIX14T(Dataset):
 
-    def __init__(self, csv_path, videos_path, transforms, max_len):
-        self.transforms = transforms
-        self.videos_path = videos_path
-        self.max_len = max_len
-        self.names = []
+pad_embeddings = lambda a, i: a[0: i] if a.shape[0] > i else np.concatenate((a, np.zeros((i - a.shape[0], a.shape[1]))), axis = 0) # for BERT embeddings
 
-        with open(csv_path, 'r') as file:
-            all_lines = file.read().splitlines()
 
-        headers = all_lines[0].split('|')
+PAD_IDX = 0
+def load_dataset_file(filename):
+    with gzip.open(filename, "rb") as f:
+        loaded_object = pickle.load(f)
+        return loaded_object
 
-        self.csv_file = dict()
 
-        for line in all_lines[1:]:
-            items = line.split('|')
-            line_dict = {header: item for header, item in zip(headers, items)}
-            self.names.append(line_dict["name"])
-            self.csv_file[line_dict["name"]] = line_dict
-
+class PhoenixDataset(Dataset.Dataset):
+    def __init__(self,text_embeddings_path, 
+                        features_path, 
+                        pt_file_path,
+                        texts_max_length,
+                        features_max_length, transform=None):
+        
+        self.data = torch.load(pt_file_path)
+        self.text_embeddings_path = text_embeddings_path
+        self.features_path = features_path
+        self.texts_max_length = texts_max_length
+        self.features_max_length = features_max_length
+        self.keys = list(self.data.keys()) 
+        self.transform = transform
+         
 
     def __len__(self):
-        return len(self.names)
+        return len(self.keys)
 
-    def __getitem__(self, index):
-        name = self.names[index]
-        img_paths = sorted(glob.glob(os.path.join(self.videos_path, name) + "/*.png"))
+    def __getitem__(self, idx):
+        if torch.is_tensor(idx):
+            idx = idx.tolist()
+        
+        key = self.keys[idx]
+        sample_data = self.data[key]
 
+        text_embedding_path = os.path.join(self.text_embeddings_path, f"{key}.npy")
+        if not os.path.exists(text_embedding_path):
+            raise FileNotFoundError(f"Text embedding file not found: {text_embedding_path}")
 
-        if len(img_paths) > self.max_len:
-            tmp = sorted(random.sample(range(len(img_paths)), k=self.max_len))
-            new_paths = []
-            for i in tmp:
-                new_paths.append(img_paths[i])
-            img_paths = new_paths
+        text_embeddings = np.load(text_embedding_path)
+        text_length = text_embeddings.shape[0]
+        text_embeddings = pad_embeddings(text_embeddings, self.texts_max_length).astype(np.float32)
 
-        imgs = []
+        features_path = os.path.join(self.features_path, f"{key}.npy")
+        if not os.path.exists(features_path):
+            raise FileNotFoundError(f"Features path file not found: {features_path}")
+        
+        features = np.load(features_path)
+        features_length = features.shape[0]
+        truncated_features = pad_or_truncate_frames(features, self.features_max_length)
+        truncated_features = truncated_features.astype(np.float32)
 
-        for path in img_paths:
-            img = cv2.cvtColor(cv2.imread(path), cv2.COLOR_BGR2RGB) / 255.0
-            img = cv2.resize(img, (224, 224))
-            img = self.transforms(img)
-            imgs.append(img)
+        sample = {
+            'text': sample_data["text"],
+            'text_embeddings': text_embeddings,
+            'features': truncated_features,
+            'gloss': sample_data["gloss"],
+            'speaker': sample_data["speaker"],
+            'features_length': features_length,
+            'idx': idx,
+            'name': key
+        }
+        if self.transform:
+            sample = self.transform(sample)
 
-        imgs = np.stack(imgs, axis=0)
-        gloss = self.csv_file[name]["orth"]
-        translation = self.csv_file[name]["translation"]
-
-        return imgs, gloss, translation
-
-def collate_fn(batch):
-    batch = sorted(batch, key=lambda x: x[0].shape[0], reverse=True)
-    videos, glosses, translations = zip(*batch)
-
-    # Convert numpy arrays to tensors if they aren't already
-    # videos = [torch.tensor(video, dtype=torch.float).permute(0, 2, 3, 1) if isinstance(video, np.ndarray) else video for video in videos]
-    videos = [torch.tensor(video, dtype=torch.float).permute(0, 2, 3, 1) if isinstance(video, np.ndarray) else video for video in videos]
-    max_length = max(video.shape[0] for video in videos)
-    padded_videos = []
-
-    for video in videos:
-        pad_size = max_length - video.shape[0]
-        # Use PyTorch operations for padding
-        padded_video = torch.cat([video, video[-1].unsqueeze(0).repeat(pad_size, 1, 1, 1)], dim=0)
-        padded_videos.append(padded_video)
-
-    padded_videos = torch.stack(padded_videos)
-
-    translations = tokenizer(translations, return_tensors="pt", padding=True, truncation=True)["input_ids"]
-
-    return padded_videos, translations
-
+        return sample

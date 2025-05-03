@@ -1,6 +1,7 @@
 import random
 import torch
 import numpy as np
+import yaml
 
 def set_seet(seed):
     torch.manual_seed(seed)
@@ -36,3 +37,49 @@ def create_trg_mask(trg, pad_token_id):
     # Combine the masks
     trg_mask = pad_mask | look_ahead_mask  # Shape: [batch_size, trg_len, trg_len]
     return trg_mask
+
+def load_config(path="train.yaml") -> dict:
+    """
+    Loads and parses a YAML configuration file.
+
+    :param path: path to YAML configuration file
+    :return: configuration dictionary
+    """
+    with open(path, "r", encoding="utf-8") as ymlfile:
+        cfg = yaml.safe_load(ymlfile)
+    return cfg
+
+def pad_or_truncate_frames(a, max_len):
+    """
+    Pads or truncates the input array to match the given max length.
+    
+    - If the sequence has fewer frames than max_len, pad with value 2.
+    - If the sequence has more frames than max_len, randomly remove frames.
+    
+    Parameters:
+        a (np.ndarray): Input array with shape (num_frames, ...).
+        max_len (int): Desired sequence length.
+    
+    Returns:
+        np.ndarray: Processed array with shape (max_len, ...).
+    """
+    num_frames = a.shape[0]
+    
+    if num_frames == max_len:
+        return a  # No change needed
+    
+    elif num_frames > max_len:
+        # Randomly select max_len indices to keep
+        indices = np.sort(np.random.choice(num_frames, max_len, replace=False))
+        return a[indices]
+    
+    else:
+        # Pad with value 2
+        pad_shape = (max_len - num_frames, *a.shape[1:])
+        return np.concatenate((a, np.full(pad_shape, 2)), axis=0)
+
+
+def create_mask(seq_lengths, max_len, device="cpu"):
+    # mask = torch.arange(max_len, device=device)[None, :] < torch.tensor(seq_lengths, device=device).clone().detach()[:, None]
+    mask = torch.arange(max_len, device=device)[None, :] < seq_lengths.clone().detach()[:, None]
+    return mask.bool()

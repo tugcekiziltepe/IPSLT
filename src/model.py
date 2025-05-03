@@ -1,98 +1,380 @@
 from torchvision.models.video import r3d_18 
 import torch.nn as nn
-from encoder import TransformerEncoder
-from decoder import TransformerDecoder
+from src.encoder import TransformerEncoder
 import torch
-from utils import create_trg_mask
-
-def make_i3d(device):
-    i3d = r3d_18(pretrained=True).to(device)
-    i3d.eval()
-    return i3d 
-
-from sacrebleu.metrics import BLEU
-from rouge import Rouge
+from src.utils import create_trg_mask, create_mask
+from src.model_utils import PositionalEncoding
+import pytorch_lightning as pl
+from einops import rearrange
+from transformers import AutoTokenizer
+import wandb
 
 
-class InitializationModule(nn.Module):
+class IPSLT(pl.LightningModule):
+
     def __init__(self,
-                hidden_size = 400,
-                ff_size = 2048,
-                num_layers = 3,
-                num_heads = 8,
-                dropout= 0.1):
-        super(InitializationModule, self).__init__()
-        self.encoder = TransformerEncoder()
-        self.decoder = TransformerDecoder()
+                cfg=None,
+                args=None,
+                text_vocab=None,
+                K = 3, 
+                KL_lambda=15,
+                dim_feedforward_e=1024,
+                dim_feedforward_d=1024,
+                encoder_dim=512,  # Encoder dimension
+                decoder_dim=512,  # Decoder dimension
+                decoder_n_heads=4,
+                encoder_n_heads=4,
+                decoder_n_layers=3,
+                encoder_n_layers=3,
+                max_frame_len=300,
+                dropout_e=0.1,
+                dropout_d=0.1,
+                activation_e="relu",
+                activation_d="relu",
+                base_learning_rate=1.0e-4,
+                label_smoothing=0.1,
+                emb_dim=512):
+        super(IPSLT, self).__init__()
 
-    def forward(self, video, translation,src_mask, tgt_mask):
-    
-        encoded = self.encoder(video, src_mask, initial = True)
-        decoded = self.decoder(translation, encoded, src_mask=src_mask, trg_mask=tgt_mask)
-
-        return encoded, decoded
-
-class IterativePrototypeRefinement(nn.Module):
-    def __init__(self,
-                hidden_size = 400,
-                ff_size = 2048,
-                num_layers = 3,
-                num_heads = 8,
-                dropout= 0.1,
-                K = 3):
-        super(IterativePrototypeRefinement, self).__init__()
-        self.encoder = TransformerEncoder()
-        self.decoder = TransformerDecoder()
-        self.K = 3
-
-    def forward(self, video, encoded_mem, translation,src_mask, tgt_mask):
+        self.cfg = cfg
+        self.args = args
+        self.text_vocab = text_vocab
+        self.max_frame_len = max_frame_len
         
+        if cfg['model'].get('K', None) != None:
+            self.K = cfg['model']['K']
+        else:
+           self.K = K
+
+        if cfg['model'].get('KL_lambda', None) != None:
+            self.KL_lambda = cfg['model']['KL_lambda']
+        else:
+           self.KL_lambda = KL_lambda
+
+        if cfg['model']['encoder'].get('n_layers', None) != None:
+            self.encoder_n_layers = cfg['model']['encoder']['n_layers']
+        else:
+           self.encoder_n_layers = encoder_n_layers
+
+        if cfg['model']['encoder'].get('n_head', None) != None:
+            self.encoder_n_heads = cfg['model']['encoder']['n_head']
+        else:
+           self.encoder_n_heads = encoder_n_heads
+
+        if cfg['model']['encoder'].get('dropout', None) != None:
+            self.dropout_e = cfg['model']['encoder']['dropout']
+        else:
+           self.dropout_e = dropout_e
+        
+        if cfg['model']['encoder'].get('activation', None) != None:
+            self.activation_e = cfg['model']['encoder']['activation']
+        else:
+           self.activation_e = activation_e
+        
+        if cfg['model']['encoder'].get('dim_feedforward', None) != None:
+            self.dim_feedforward_e = cfg['model']['encoder']['dim_feedforward']
+        else:
+           self.dim_feedforward_e = dim_feedforward_e
+        
+        if cfg['model']['encoder'].get('encoder_dim', None) != None:
+            self.encoder_dim = cfg['model']['encoder']['encoder_dim']
+        else:
+           self.encoder_dim = encoder_dim
+
+        # ---- DECODER ---
+
+        if cfg['model']['decoder'].get('n_layers', None) != None:
+            self.decoder_n_layers = cfg['model']['decoder']['n_layers']
+        else:
+           self.decoder_n_layers = decoder_n_layers
+        
+        if cfg['model']['decoder'].get('n_head', None) != None:
+            self.decoder_n_heads = cfg['model']['decoder']['n_head']
+        else:
+           self.decoder_n_heads = decoder_n_heads
+        
+        if cfg['model']['decoder'].get('decoder_dim', None) != None:
+            self.decoder_dim = cfg['model']['decoder']['decoder_dim']
+        else:
+            self.decoder_dim = decoder_dim  
+        
+        if cfg['model']['decoder'].get('activation', None) != None:
+            self.activation_d = cfg['model']['decoder']['activation']
+        else:
+           self.activation_d = activation_d
+
+        if cfg['model']['decoder'].get('dropout', None) != None:
+            self.dropout_d = cfg['model']['decoder']['dropout']
+        else:
+           self.dropout_d = dropout_d
+
+        if cfg['model']['decoder'].get('dim_feedforward', None) != None:
+            self.dim_feedforward_d = cfg['model']['decoder']['dim_feedforward']
+        else:
+            self.dim_feedforward_d = dim_feedforward_d
+
+        if cfg['model']['embeddings'].get('embedding_dim', None) != None:
+            self.emb_dim = cfg['model']['embeddings']['embedding_dim']
+        else:
+           self.emb_dim = emb_dim
+
+        self.text_emb = nn.Linear(in_features=768, out_features=self.emb_dim)
+
+        ## TRAINING
+        if cfg['training'].get('base_learning_rate', None) != None:
+            self.learning_rate = cfg['training']['base_learning_rate']
+        else:
+            self.learning_rate = base_learning_rate  
+
+        if cfg['training'].get('label_smoothing', None) != None:
+            self.label_smoothing = cfg['training']['label_smoothing']
+        else:
+           self.label_smoothing = label_smoothing
+
+        self.tokenizer = AutoTokenizer.from_pretrained("dbmdz/bert-base-german-cased") 
+
+        self.training_step_outputs = []
+        self.valid_step_outputs = []
+        self.valid_losses = []
+        self.train_losses = []
+
+        # protoype inititialization
+        encoder_layer1 = nn.TransformerEncoderLayer(self.encoder_dim, self.encoder_n_heads, self.dim_feedforward_e, self.dropout_e, self.activation_e, batch_first=True)
+        self.encoder1 = nn.TransformerEncoder(encoder_layer=encoder_layer1, num_layers=self.encoder_n_layers)
+
+        decoder_layer1 = nn.TransformerDecoderLayer(self.decoder_dim, self.decoder_n_heads, self.dim_feedforward_d, self.dropout_d, self.activation_d, batch_first=True)
+        self.decoder1 = nn.TransformerDecoder(decoder_layer=decoder_layer1, num_layers=self.decoder_n_layers)
+        self.vocab_projection1 = nn.Linear(self.decoder_dim, self.tokenizer.vocab_size)
+
+        # --- prototype refinement module ---
+        self.encoder2 = TransformerEncoder(hidden_size = self.encoder_dim, ff_size= self.dim_feedforward_e, num_layers=self.encoder_n_layers, num_heads=self.encoder_n_heads, dropout=self.dropout_e)
+
+        decoder_layer2 = nn.TransformerDecoderLayer(self.decoder_dim, self.decoder_n_heads, self.dim_feedforward_d, self.dropout_d, self.activation_d, batch_first=True)
+        self.decoder2 = nn.TransformerDecoder(decoder_layer=decoder_layer2, num_layers=self.decoder_n_layers)
+
+        self.pos_encoding = PositionalEncoding(self.decoder_dim)
+
+        self.vocab_projection2 = nn.Linear(self.decoder_dim, self.tokenizer.vocab_size)
+
+    
+    def forward(self, text_embed, text_mask, features, features_mask):
+        text_embed = self.pos_encoding(text_embed) 
+        tgt_seq_len = text_embed.size(1)
+        device = text_embed.device
+
+        tgt_mask = torch.triu(torch.ones(tgt_seq_len, tgt_seq_len, device=device) == 1, diagonal=1)
+        tgt_mask = tgt_mask.float().masked_fill(tgt_mask == 1, float('-inf'))
+        
+        features = self.pos_encoding(features)
+
         decoder_outputs = []
+        # --- PROTOTYPE INITIALIZATION MODULE ---
+        enc_outs = self.encoder1(features, src_key_padding_mask=~features_mask)
+        dec_outs = self.decoder1(
+            tgt=text_embed,
+            memory=enc_outs,
+            tgt_mask=tgt_mask,
+            tgt_key_padding_mask=~text_mask,              # (batch_size, tgt_seq_len)
+            memory_key_padding_mask=~features_mask        # (batch_size, src_seq_len)
+        )
+        dec_outs = self.vocab_projection1(dec_outs)
+        decoder_outputs.append(dec_outs)
+
+        # --- PROTOTYPE REFINEMENT MODULE ---
+
         for i in range(self.K):
-            encoded = self.encoder(video, src_mask, encoded_mem)
-            decoded = self.decoder(video, encoded, src_mask=src_mask, trg_mask=tgt_mask)
-            decoder_outputs.append(decoded[0].detach().cpu())
+            enc_outs = self.encoder2(features, features_mask, enc_outs)
+
+            dec_outs = self.decoder2(
+                        tgt=text_embed,
+                        memory=enc_outs,
+                        tgt_mask=tgt_mask,
+                        tgt_key_padding_mask=~text_mask,
+                        memory_key_padding_mask=~features_mask
+                        )
+            dec_outs = self.vocab_projection2(dec_outs)
+            decoder_outputs.append(dec_outs)
+
         return decoder_outputs
 
+    def share_step(self, tgt_ids, text_embed, text_mask, features, features_mask, split="train"):
+        """
+        One step of training/validation using BERT embeddings as input and TransformerDecoder outputs.
+        Calculates cross-entropy loss for the first and last decoder outputs,
+        and KL divergence loss between intermediate and final decoder outputs.
+        """
 
-class IPSLT(nn.Module):
+        # Forward pass through the model
+        decoder_outs = self(text_embed, text_mask, features, features_mask)
 
-    def __init__(self,
-                device,
-                hidden_size = 400,
-                ff_size = 2048,
-                num_layers = 3,
-                num_heads = 8,
-                dropout= 0.1, K = 3):
-        super(IPSLT, self).__init__()
-        self.initalization_module = InitializationModule()
-        self.iterative_prototype_refinement = IterativePrototypeRefinement()
-        # Parameters
-        vocab_size = 1000  # Example vocabulary size
-        embedding_dim = 400  # Number of features per embedding
+        # Split decoder outputs
+        first_output = decoder_outs[0]         # Initial decoder output
+        last_output = decoder_outs[-1]         # Final refined decoder output
+        intermediate_outputs = decoder_outs[1:-1]  # All intermediate outputs
 
-        # Creating the embedding layer
-        self.embedding_layer = nn.Embedding(31102, embedding_dim)
-        self.i3d = make_i3d(device)
-        self.device = device
+        # --- Cross Entropy Loss ---
+        ce_loss_fn = torch.nn.CrossEntropyLoss(ignore_index=self.text_vocab["[PAD]"])
+
+        # Reshape decoder outputs and targets to compute CE loss
+        ce_loss_first = ce_loss_fn(
+            first_output.view(-1, first_output.size(-1)), 
+            tgt_ids.view(-1)
+        )
+        ce_loss_last = ce_loss_fn(
+            last_output.view(-1, last_output.size(-1)), 
+            tgt_ids.view(-1)
+        )
+
+
+        # --- KL Divergence Loss ---
+        # Measures how close intermediate outputs are to the final output
+        kl_loss_fn = torch.nn.KLDivLoss(reduction="none")
+        kl_div_loss_total = 0.0
+
+        for inter_out in intermediate_outputs:
+            kl_div = kl_loss_fn(
+                torch.log_softmax(inter_out, dim=-1),              # log probabilities from intermediate decoder
+                torch.softmax(last_output.detach(), dim=-1)        # target distribution from final decoder
+            )
+            mask = text_mask.unsqueeze(-1).expand_as(kl_div)  # [B, T, V]
+
+            # Zero out the loss for padding positions
+            kl_div = kl_div * mask  # [B, T, V]
+
+            kl_div = kl_div.sum() / mask.sum()
+
+            kl_div_loss_total += kl_div
+
+        # Apply weighting factor to the KL divergence loss
+        kl_div_loss_total = self.KL_lambda * kl_div_loss_total
+
+        # --- Logging dictionary ---
+        log_dict = {
+            f"{split}/ce_loss_first": ce_loss_first.detach(),
+            f"{split}/ce_loss_last": ce_loss_last.detach(),
+            f"{split}/total_kl_div_loss": kl_div_loss_total.detach(),
+        }
+
+        # Total loss is a combination of cross-entropy and KL losses
+        total_loss = ce_loss_first + ce_loss_last + kl_div_loss_total
+        log_dict[f"{split}/total_loss"] = total_loss.detach()
+
+        if split == "train":
+            wandb.log({
+                f"{split}/ce_loss_first": ce_loss_first.detach(),
+                f"{split}/ce_loss_last": ce_loss_last.detach(),
+                f"{split}/total_kl_div_loss": kl_div_loss_total.detach(),
+            })
+        elif split == "val":
+            wandb.log({
+                f"{split}/ce_loss_first": ce_loss_first.detach(),
+                f"{split}/ce_loss_last": ce_loss_last.detach(),
+                f"{split}/total_kl_div_loss": kl_div_loss_total.detach(),
+            })
+        generated_ids_last = torch.argmax(last_output, dim=-1)
+        generated_text_last = self.tokenizer.batch_decode(generated_ids_last, skip_special_tokens=True)
+
+        generated_ids_first = torch.argmax(first_output, dim=-1)
+        generated_text_first = self.tokenizer.batch_decode(generated_ids_first, skip_special_tokens=True)
+
+        if split == "train":
+            wandb.log({"train/sample_text_init": wandb.Html("<br>".join(generated_text_first))})
+        elif split == "val":
+            wandb.log({"val/sample_text_init": wandb.Html("<br>".join(generated_text_first))})
+        
+        if split == "train":
+            wandb.log({"train/sample_text_last": wandb.Html("<br>".join(generated_text_last))})
+        elif split == "val":
+            wandb.log({"val/sample_text_last": wandb.Html("<br>".join(generated_text_last))})
+
+
+
+        return total_loss, log_dict
+
     
-    
+    def get_inputs(self, batch):
+        text_embed = batch["text_embeddings"]
+        text = batch["text"]
+        encoding = self.tokenizer(
+            text,
+            padding="max_length",     
+            max_length=text_embed.shape[1],
+            truncation=True,
+            return_tensors="pt"
+        )
 
-    def forward(self, batch_video_clips, translation):
-        # translation shape: (batch_size x 1 x 400)
-        embeddings = self.embedding_layer(translation.to(self.device)) # batch_size x 1 x seq_length x feature_size
-        batch_video_clips = batch_video_clips.squeeze(1).permute(0, 2, 1, 3, 4).to(self.device).float() 
-        print(batch_video_clips.shape)
-        features = self.i3d(batch_video_clips) # batch_size x feature_size
-        # # Concatenate the original tensor with the zeros tensor
-        sgn_mask = (features != torch.zeros(400).to(self.device))[..., 0].to(self.device)#.unsqueeze(1) # # batch_size x batch_size x 1 x 400
-        trg_mask = create_trg_mask(translation, 0).to(self.device) # batch_size x 400 x 400
-        print(trg_mask.shape)
-        # decoder_outputs_new = []
-        encoded, decoder_output = self.initalization_module(features, embeddings, sgn_mask, trg_mask)
-        # decoder_outputs_new.append(decoder_output[0].cpu())
-        # decoder_outputs = self.iterative_prototype_refinement(features_video_clips, encoded, embeddings, sgn_mask, trg_mask.repeat(8, 1, 1))
-        # decoder_outputs_new.extend(decoder_outputs)
-        # features_video_clips = features_video_clips.detach().cpu()
-        # del features_video_clips
-        # return decoder_outputs_new
+        tgt_ids = encoding["input_ids"] 
+
+        features = batch["features"]
+        features_lengths = batch["features_length"]
+
+        features_mask = create_mask(features_lengths, self.max_frame_len, device=self.device)
+
+        text_mask = (text_embed != self.text_vocab["[PAD]"])
+        text_mask = text_mask[:, :, 0] # BERT embeddings
+
+        # Map tensor to device
+        text_embed, features = map(lambda tensor: tensor.to(self.device), [text_embed, features])
+        text_mask, features_mask = map(lambda tensor: tensor.to(self.device), [text_mask, features_mask])
+
+        return (tgt_ids, text_embed, text_mask), (features, features_mask)
+    
+    def training_step(self, batch, batch_idx):
+
+        (tgt_ids, text_embed, text_mask), (features, features_mask) = self.get_inputs(batch)
+
+        total_loss, log_dict = self.share_step(tgt_ids, text_embed, text_mask, features, features_mask, split="train")
+        self.log_dict(log_dict, prog_bar=True, sync_dist=True)
+        self.training_step_outputs.append(total_loss)
+
+        lr = self.trainer.optimizers[0].param_groups[0]['lr']
+        # Log the learning rate
+        self.log('lr', lr, prog_bar=True, logger=True, sync_dist=True)
+        
+        return total_loss
+
+    def on_train_epoch_end(self):
+        # Calculate and store the mean loss for the epoch
+        epoch_loss = torch.stack([loss for loss in self.training_step_outputs]).mean()
+        self.train_losses.append(epoch_loss.item())   
+
+    def validation_step(self, batch, batch_idx):
+        (tgt_ids, text_embed, text_mask), (features, features_mask) = self.get_inputs(batch)
+        total_loss, log_dict = self.share_step(tgt_ids, text_embed, text_mask, features, features_mask, split="valid")
+        self.log_dict(log_dict, prog_bar=True, sync_dist=True)
+
+        self.valid_step_outputs.append(total_loss)
+
+        return total_loss
+    def on_validation_epoch_end(self):
+        # Calculate and store the mean loss for the epoch
+        epoch_loss = torch.stack([loss for loss in self.valid_step_outputs]).mean()
+        self.valid_losses.append(epoch_loss.item())
+
+    def configure_optimizers(self):
+        lr = self.learning_rate
+        optimizer = torch.optim.Adam(
+            self.parameters(), 
+            lr=lr, 
+            weight_decay=0.0005
+        )
+
+        # ReduceLROnPlateau Scheduler (Train Loss'a Göre)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, 
+            mode='min',           # Minimum train loss izlenir
+            factor=0.9,           # LR 0.5 ile çarpılır
+            patience=40,          # 40 epoch boyunca iyileşme olmazsa LR azaltılır
+            verbose=True,         # LR azaldığında log basılır
+            min_lr=1e-12          # Minimum öğrenme oranı
+        )
+
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'monitor': 'valid/total_loss',
+                'interval': 'epoch',
+                'frequency': 1,
+            }
+        }
