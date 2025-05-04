@@ -197,6 +197,75 @@ class IPSLT(pl.LightningModule):
 
         return decoder_outputs
 
+
+    def predict(self, features, features_mask, beam_size=5, max_len=52):
+        batch_size = features.size(0)
+        device = features.device
+
+        # BOS token ID
+        bos_token_id = self.text_vocab["[BOS]"]
+        eos_token_id = self.text_vocab["[EOS]"]
+
+        # Positional encoding
+        features = self.pos_encoding(features)
+
+        # Initial encoder output
+        enc_outs = self.encoder1(features, src_key_padding_mask=~features_mask)
+        for _ in range(self.K):
+            enc_outs = self.encoder2(features, features_mask, enc_outs)
+
+        # Each element in the batch will have `beam_size` candidates
+        sequences = [[([bos_token_id], 0.0)] for _ in range(batch_size)]  # List of tuples (sequence, score)
+
+        for step in range(max_len):
+            all_candidates = []
+            for b in range(batch_size):
+                candidates = sequences[b]
+                temp_candidates = []
+
+                for seq, score in candidates:
+                    if seq[-1] == eos_token_id:
+                        temp_candidates.append((seq, score))
+                        continue
+
+                    # Prepare input
+                    seq_tensor = torch.tensor(seq, device=device).unsqueeze(0)  # (1, seq_len)
+                    text_embed = self.token_embedding(seq_tensor)  # Assuming you have token_embedding layer
+                    text_embed = self.pos_encoding(text_embed)
+
+                    tgt_seq_len = text_embed.size(1)
+                    tgt_mask = torch.triu(torch.ones(tgt_seq_len, tgt_seq_len, device=device) == 1, diagonal=1)
+                    tgt_mask = tgt_mask.float().masked_fill(tgt_mask == 1, float('-inf'))
+
+                    dec_out = self.decoder2(
+                        tgt=text_embed,
+                        memory=enc_outs[b:b+1],  # select batch b
+                        tgt_mask=tgt_mask,
+                        tgt_key_padding_mask=None,
+                        memory_key_padding_mask=~features_mask[b:b+1]
+                    )
+                    logits = self.vocab_projection2(dec_out[:, -1, :])  # (1, vocab_size)
+                    log_probs = torch.log_softmax(logits, dim=-1)  # (1, vocab_size)
+
+                    topk_log_probs, topk_indices = torch.topk(log_probs, beam_size, dim=-1)
+
+                    for i in range(beam_size):
+                        new_seq = seq + [topk_indices[0, i].item()]
+                        new_score = score + topk_log_probs[0, i].item()
+                        temp_candidates.append((new_seq, new_score))
+
+                # Keep top-k sequences
+                ordered = sorted(temp_candidates, key=lambda tup: tup[1], reverse=True)
+                sequences[b] = ordered[:beam_size]
+
+        # Select best sequence for each item in batch
+        final_sequences = []
+        for b in range(batch_size):
+            best_seq = max(sequences[b], key=lambda tup: tup[1])[0]
+            final_sequences.append(best_seq)
+
+        return final_sequences
+
     def share_step(self, tgt_ids, text_embed, text_mask, features, features_mask, split="train"):
         """
         One step of training/validation using BERT embeddings as input and TransformerDecoder outputs.
@@ -261,37 +330,20 @@ class IPSLT(pl.LightningModule):
         total_loss = ce_loss_first + ce_loss_last + kl_div_loss_total
         log_dict[f"{split}/total_loss"] = total_loss.detach()
 
-        if split == "train":
-            wandb.log({
-                f"{split}/ce_loss_first": ce_loss_first.detach(),
-                f"{split}/ce_loss_last": ce_loss_last.detach(),
-                f"{split}/total_kl_div_loss": kl_div_loss_total.detach(),
-                f"{split}/total_loss": total_loss.detach()
+        wandb.log({
+            f"{split}/ce_loss_first": ce_loss_first.detach(),
+            f"{split}/ce_loss_last": ce_loss_last.detach(),
+            f"{split}/total_kl_div_loss": kl_div_loss_total.detach(),
+            f"{split}/total_loss": total_loss.detach()})
 
-            })
-        elif split == "val":
-            wandb.log({
-                f"{split}/ce_loss_first": ce_loss_first.detach(),
-                f"{split}/ce_loss_last": ce_loss_last.detach(),
-                f"{split}/total_kl_div_loss": kl_div_loss_total.detach(),
-                f"{split}/total_loss": total_loss.detach()
-            })
         generated_ids_last = torch.argmax(last_output, dim=-1)
         generated_text_last = self.tokenizer.batch_decode(generated_ids_last, skip_special_tokens=True)
 
         generated_ids_first = torch.argmax(first_output, dim=-1)
         generated_text_first = self.tokenizer.batch_decode(generated_ids_first, skip_special_tokens=True)
 
-        if split == "train":
-            wandb.log({"train/sample_text_init": wandb.Html("<br>".join(generated_text_first))})
-        elif split == "val":
-            wandb.log({"val/sample_text_init": wandb.Html("<br>".join(generated_text_first))})
-        
-        if split == "train":
-            wandb.log({"train/sample_text_last": wandb.Html("<br>".join(generated_text_last))})
-        elif split == "val":
-            wandb.log({"val/sample_text_last": wandb.Html("<br>".join(generated_text_last))})
-
+        wandb.log({f"{split}/sample_text_init": wandb.Html("<br>".join(generated_text_first))})
+        wandb.log({"f{split}/sample_text_last": wandb.Html("<br>".join(generated_text_last))})
 
 
         return total_loss, log_dict
